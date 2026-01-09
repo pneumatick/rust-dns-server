@@ -715,12 +715,61 @@ impl DnsPacket {
 
         Ok(())
     }
+
+    // Get an random A record from a packet
+    pub fn get_random_a(&self) -> Option<Ipv4Addr> {
+        self.answers
+            .iter()
+            .filter_map(|record| match record {
+                DnsRecord::A {addr, ..} => Some(*addr),
+                _ => None,
+            })
+            .next()
+    }
+
+    // Helper function that returns name servers in an iterator, which 
+    // are represented as (domain, host) tuples
+    fn get_ns<'a>(&'a self, qname: &'a str) -> impl Iterator<Item = (&'a str, &'a str)> {
+        self.authorities
+            .iter()
+            .filter_map(|record| match record {
+                DnsRecord::NS { domain, host, .. } => Some((domain.as_str(), host.as_str())),
+                _ => None,
+            
+            })
+        // Remove servers which aren't authoritative for our query
+        .filter(move |(domain, _)| qname.ends_with(*domain))
+    }
+
+    // Return the actual IP corresponding to some NS record
+    pub fn get_resolved_ns(&self, qname: &str) -> Option<Ipv4Addr> {
+        self.get_ns(qname)
+            .flat_map(|(_, host)| {
+                self.resources
+                    .iter()
+                    // Filter for the A records that match the name server
+                    .filter_map(move |record| match record {
+                        DnsRecord::A { domain, addr, .. } if domain == host => Some(addr),
+                        _ => None,
+                    })
+            })
+            .map(|addr| *addr)
+            .next()
+    }
+
+    // Return a hostname to perform another query if the server doesn't 
+    // provide any A records in the "additional section"
+    pub fn get_unresolved_ns<'a>(&'a self, qname: &'a str) -> Option<&'a str> {
+        self.get_ns(qname)
+            .map(|(_, host)| host)
+            .next()
+    }
 }
 
-// Perform a DNS query by proxy
-fn lookup(qname: &str, qtype: QueryType) -> Result<DnsPacket> {
-    // Google's DNS server
-    let server = ("8.8.8.8", 53);
+// Perform a DNS query
+fn lookup(qname: &str, qtype: QueryType, server: (Ipv4Addr, u16)) -> Result<DnsPacket> {
+    // Google's DNS server for using server as a proxy
+    //let server = ("8.8.8.8", 53);
 
     // Bind a UDP socket on an arbitrary port
     let socket = UdpSocket::bind(("0.0.0.0", 43210))?;
@@ -747,6 +796,56 @@ fn lookup(qname: &str, qtype: QueryType) -> Result<DnsPacket> {
     DnsPacket::from_buffer(&mut res_buffer)
 }
 
+// Perform a recursive query
+fn recursive_lookup(qname: &str, qtype: QueryType) -> Result<DnsPacket> {
+    // Using "a.root-servers.net" for now
+    let mut ns = "198.41.0.4".parse::<Ipv4Addr>().unwrap();
+
+    loop {
+        println!("Attempting lookup of {:?} {} with NS {}", qtype, qname, ns);
+
+        // Send the query to the active server
+        let ns_copy = ns;
+        let server = (ns_copy, 53);
+        let response = lookup(qname, qtype, server)?;
+
+        // Terminate if no entries in answer section and no errors
+        if !response.answers.is_empty() && response.header.rescode == ResultCode::NOERROR {
+            return Ok(response);
+        }
+
+        // Handle case of 'NXDOMAIN' reply (NoneXistant domain)
+        if response.header.rescode == ResultCode::NXDOMAIN {
+            return Ok(response);
+        }
+
+        // Attempt to find new nameserver and restart loop
+        if let Some(new_ns) = response.get_resolved_ns(qname) {
+            ns = new_ns;
+
+            continue;
+        }
+
+        // Resolve IP of some NS record, or return last response if none exist
+        let new_ns_name = match response.get_unresolved_ns(qname) {
+            Some(x) => x,
+            None => return Ok(response),
+        };
+
+        // Recursive call with new NS name to continue lookup/query
+        let recursive_response = recursive_lookup(&new_ns_name, QueryType::A)?;
+
+        // Either pick an IP from the result and restart loop or return 
+        // the last response
+        if let Some(new_ns) = recursive_response.get_random_a() {
+            ns = new_ns;
+        }
+        else {
+            return Ok(response);
+        }
+    }
+}
+
 // Handle an incoming packet
 fn handle_query(socket: &UdpSocket) -> Result<()> {
     // Read the packet
@@ -766,8 +865,8 @@ fn handle_query(socket: &UdpSocket) -> Result<()> {
         println!("Received query: {:?}", question);
 
         // Forward the query to the target server (8.8.8.8)
-        if let Ok(result) = lookup(&question.name, question.qtype) {
-            packet.questions.push(question);
+        if let Ok(result) = recursive_lookup(&question.name, question.qtype) {
+            packet.questions.push(question.clone());
             packet.header.rescode = result.header.rescode;
             
             for rec in result.answers {
